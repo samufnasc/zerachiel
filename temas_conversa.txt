@@ -1,0 +1,47 @@
+# 🚀 PROJETO: VoiceAssistant
+# Integração de I.A. com comandos de voz e resposta interativa
+
+## 📑 Resumo do Desenvolvimento
+O projeto evoluiu de um protótipo simples para um assistente robusto com inteligência artificial de alta velocidade (Groq), voz natural (edge-tts) e controles de interrupção integrados.
+
+---
+
+## 🛠️ Status dos Tópicos
+
+### ✅ TÓPICO 1 - DESENVOLVER PROJETO (Concluído)
+*Construção da fundação modular do sistema.*
+- 🎤 **Entrada de voz:** `speech_recognition` via microfone.
+- 🔊 **Saída de voz:** `edge-tts` (Microsoft Edge) para vozes naturais.
+- 🧠 **Motor de I.A.:** Arquitetura Dual (`Groq API` para velocidade e `Ollama` para uso local).
+- 🖥️ **Interface:** Console interativo com resposta de texto e código.
+- 🛑 **Controle:** Implementação de interrupção via tecla `P` e comando de voz `"certo assistente"`.
+
+**📂 Estrutura de Arquivos:**
+- `main.py` 🚀 (Ponto de entrada)
+- `config.py` ⚙️ (Configurações do sistema)
+- `voice_input.py` 🎙️ (Captura de áudio)
+- `voice_output.py` 🔊 (Síntese de voz)
+- `ai_engine.py` 🧠 (Integração com I.A.)
+- `requirements.txt` 📦 (Dependências)
+
+### ✅ TÓPICO 2 - TESTAR (Concluído)
+*Validação das funcionalidades centrais.*
+- ⚡ **Velocidade:** Testes com Groq mostraram respostas instantâneas.
+- 🗣️ **Voz:** Validação de áudio natural e limpeza de caracteres especiais.
+- ⌨️ **Interrupção:** Teste de pausa via teclado e voz aprovado.
+
+### ⏳ TÓPICO 3 - VERIFICAR (Em progresso)
+*Ajustes finos e expansão.*
+- [ ] Validar fluxo completo com Ollama local.
+- [ ] Testar estabilidade da captura de voz em ambientes ruidosos.
+- [ ] Planejar migração para dispositivos móveis.
+
+---
+
+## 📝 Observações Estratégicas
+- 🌐 **Acesso:** Inicialmente via terminal/web no computador.
+- 📱 **Futuro:** Implementação para dispositivos móveis após validação PC.
+- 🎙️ **Modo de Uso:** O assistente sempre fala. Se o conteúdo for complexo (como código), ele avisa por voz e exibe o texto na tela.
+
+---
+## 📈 Progresso Geral: [▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓] 100% da base concluída.
