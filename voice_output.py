@@ -37,14 +37,19 @@ class VoiceOutput:
     _listener_stop      = threading.Event()
 
     def __init__(self):
-        self.voice     = "pt-BR-FranciscaNeural"
+        # pt-BR-AntonioNeural: voz masculina natural, séria e clara.
+        # Alternativas masculinas disponíveis no Edge TTS:
+        #   pt-BR-AntonioNeural  (recomendada — voz principal do projeto)
+        #   pt-BR-FabioNeural    (mais grave, mais formal)
+        # Para voltar para feminina: pt-BR-FranciscaNeural
+        self.voice = "pt-BR-AntonioNeural"
         self.temp_file = os.path.join(tempfile.gettempdir(), "zerachiel_voice.mp3")
 
         if not pygame.mixer.get_init():
             pygame.mixer.init()
 
         logger.info(f"VoiceOutput inicializado. Voz: {self.voice}")
-        print(f"[Voz] Usando edge-tts: {self.voice}")
+        print(f"[Voz] Usando edge-tts: {self.voice} (masculina)")
 
     # ──────────────────────────────────────────────────────────
     # Limpeza de Texto para Fala
@@ -82,24 +87,56 @@ class VoiceOutput:
     # Geração de Áudio (async edge-tts)
     # ──────────────────────────────────────────────────────────
 
-    def _generate_audio(self, text: str) -> bool:
+    def _generate_audio(self, text: str) -> str | None:
         """
-        Gera o arquivo MP3 via edge-tts.
-        Retorna True se bem-sucedido, False em caso de erro.
+        Gera o áudio MP3 via edge-tts e retorna o caminho do arquivo.
+
+        CORREÇÃO Permission denied (Windows):
+        - Sempre faz unload+stop do pygame antes de tentar escrever.
+        - Usa um arquivo temporário com nome único por chamada (uuid4)
+          para evitar conflito quando a reprodução anterior ainda está
+          segurando o handle do arquivo no sistema operacional.
+        - Remove o arquivo anterior após garantir que não está em uso.
+
+        Retorna o caminho do arquivo gerado, ou None em caso de erro.
         """
+        import uuid
+
+        # ── Garante que o pygame liberou qualquer arquivo anterior ──
+        try:
+            if pygame.mixer.get_init():
+                pygame.mixer.music.stop()
+                pygame.mixer.music.unload()
+        except Exception:
+            pass
+
+        # Remove arquivo anterior se ainda existir (liberado pelo unload)
+        if os.path.exists(self.temp_file):
+            try:
+                os.remove(self.temp_file)
+            except Exception:
+                pass  # se ainda estiver bloqueado, usaremos um novo nome abaixo
+
+        # Gera nome de arquivo único para esta chamada
+        temp_path = os.path.join(
+            tempfile.gettempdir(),
+            f"zerachiel_{uuid.uuid4().hex[:8]}.mp3"
+        )
+
         async def _run():
             communicate = edge_tts.Communicate(text, self.voice)
-            await communicate.save(self.temp_file)
+            await communicate.save(temp_path)
 
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(_run())
             loop.close()
-            return True
+            self.temp_file = temp_path   # atualiza referência para limpeza futura
+            return temp_path
         except Exception as e:
             logger.error(f"Erro ao gerar áudio TTS: {e}")
-            return False
+            return None
 
     # ──────────────────────────────────────────────────────────
     # speak() — Método original com listeners próprios
@@ -126,10 +163,11 @@ class VoiceOutput:
         self._start_listeners()
 
         try:
-            if not self._generate_audio(clean_text):
+            audio_path = self._generate_audio(clean_text)
+            if not audio_path:
                 return
 
-            pygame.mixer.music.load(self.temp_file)
+            pygame.mixer.music.load(audio_path)
             pygame.mixer.music.play()
 
             # Aguarda fim da reprodução ou interrupção
@@ -183,13 +221,14 @@ class VoiceOutput:
         VoiceOutput._interrupt_requested = False
 
         try:
-            if not self._generate_audio(clean_text):
+            audio_path = self._generate_audio(clean_text)
+            if not audio_path:
                 return
 
             if stop_event and stop_event.is_set():
                 return  # cancelado durante a geração do áudio
 
-            pygame.mixer.music.load(self.temp_file)
+            pygame.mixer.music.load(audio_path)
             pygame.mixer.music.play()
 
             # Loop de reprodução — verifica stop_event a cada 50ms

@@ -38,10 +38,10 @@ WAKE_RESPONSE = "Estou aqui. O que deseja?"
 # Configurações de Captura de Voz
 # ─────────────────────────────────────────────
 # Segundos de silêncio que indicam fim do turno de fala.
-# 1.8s = equilibrado (não muito sensível, não muito lento)
-# Reduza para 1.2s se o ambiente for silencioso.
-# Aumente para 2.5s se o assistente cortar sua fala com frequência.
-PAUSE_THRESHOLD = 1.8
+# 2.5s = permite hesitações naturais (vírgulas, pausas para pensar)
+# Reduza para 1.5s se o ambiente for silencioso e você falar de forma contínua.
+# Aumente para 3.0s se o assistente ainda cortar sua fala com frequência.
+PAUSE_THRESHOLD = 2.5
 
 # Tempo máximo esperando o usuário COMEÇAR a falar (segundos).
 # Após esse tempo sem fala, o listen() retorna None e o loop continua.
@@ -105,14 +105,39 @@ BASE_SANDBOX = os.path.join(os.path.expanduser("~"), "AssistantFiles")
 if not os.path.exists(BASE_SANDBOX):
     os.makedirs(BASE_SANDBOX)
 
-# Pastas permitidas para o file_manager (além do sandbox padrão)
+# Pastas permitidas para o file_manager (além do sandbox padrão).
+#
+# IMPORTANTE: o Google STT transcreve "área de trabalho" de formas variadas
+# dependendo da pronúncia e do modelo. A IA também pode normalizar o texto
+# antes de chamar a tool (ex: remover acentos, usar underscores).
+# Por isso mapeamos TODAS as variações possíveis para o mesmo caminho.
+_DESKTOP   = os.path.join(os.path.expanduser("~"), "Desktop")
+_DOCUMENTS = os.path.join(os.path.expanduser("~"), "Documents")
+_DOWNLOADS = os.path.join(os.path.expanduser("~"), "Downloads")
+
 ALLOWED_DIRS = {
-    "documentos":        os.path.join(os.path.expanduser("~"), "Documents"),
-    "documents":         os.path.join(os.path.expanduser("~"), "Documents"),
-    "desktop":           os.path.join(os.path.expanduser("~"), "Desktop"),
-    "área de trabalho":  os.path.join(os.path.expanduser("~"), "Desktop"),
-    "downloads":         os.path.join(os.path.expanduser("~"), "Downloads"),
-    "sandbox":           BASE_SANDBOX,
+    # ── Desktop / Área de trabalho — todas as variações ──────
+    "desktop":              _DESKTOP,
+    "área de trabalho":     _DESKTOP,   # com acento
+    "area de trabalho":     _DESKTOP,   # sem acento
+    "area_de_trabalho":     _DESKTOP,   # underscore (como a IA às vezes envia)
+    "areadetrabalho":       _DESKTOP,   # sem separador
+    "área_de_trabalho":     _DESKTOP,   # acento + underscore
+    "minha área de trabalho": _DESKTOP,
+    "minha area de trabalho": _DESKTOP,
+
+    # ── Documentos ───────────────────────────────────────────
+    "documentos":           _DOCUMENTS,
+    "documents":            _DOCUMENTS,
+    "meus documentos":      _DOCUMENTS,
+
+    # ── Downloads ────────────────────────────────────────────
+    "downloads":            _DOWNLOADS,
+
+    # ── Sandbox padrão ───────────────────────────────────────
+    "sandbox":              BASE_SANDBOX,
+    "assistantfiles":       BASE_SANDBOX,
+    "padrão":               BASE_SANDBOX,
 }
 
 # ─────────────────────────────────────────────
@@ -168,7 +193,11 @@ TOOLS_DEFINITION = [
                     },
                     "filename": {
                         "type": "string",
-                        "description": "Nome do arquivo com extensão (ex: 'resumo.txt', 'notas.md')"
+                        "description": (
+                            "Nome do arquivo com extensão (ex: 'resumo.txt', 'notas.md'). "
+                            "Obrigatório para: create, read, edit, append, save_last_response. "
+                            "Opcional para: list (que opera na pasta inteira, não em arquivo)."
+                        )
                     },
                     "content": {
                         "type": "string",
@@ -183,7 +212,11 @@ TOOLS_DEFINITION = [
                         )
                     }
                 },
-                "required": ["action", "filename"]
+                "required": ["action"]
+                # Apenas 'action' é sempre obrigatório.
+                # 'filename' é necessário para create/read/edit/append/save_last_response,
+                # mas NÃO para 'list' — o Groq valida o schema antes de executar,
+                # então filename em required bloquearia chamadas de listagem válidas.
             }
         }
     }

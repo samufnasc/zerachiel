@@ -1,12 +1,17 @@
 # ============================================================
-# main_gui.py — Orquestrador Principal do Zerachiel
-# Conecta: Interface (GUI) ↔ Motor de IA ↔ Voz (entrada/saída)
+# main_gui.py — Orquestrador Principal do Zerachiel v3.1
 #
 # MÁQUINA DE ESTADOS:
 #   SLEEPING  → aguarda wake word; ignora todo o resto
-#   AWAKE     → processa comandos; monitora inatividade
-#   SPEAKING  → assistente falando; escuta em paralelo por
-#               pausa, interrupção ou novo comando
+#   AWAKE     → processa comandos do usuário
+#   SPEAKING  → assistente falando; loop principal PARA listen();
+#               escuta paralela assume com listen_for_interrupt()
+#
+# CORREÇÃO v3.1:
+#   O loop principal agora usa _is_speaking_flag para saber quando
+#   o assistente está falando e SUSPENDE listen() nesse período.
+#   Isso elimina o conflito de duas threads gravando ao mesmo tempo,
+#   que causava cortes e transcrições quebradas.
 # ============================================================
 
 import sys
@@ -15,7 +20,6 @@ import threading
 import time
 import logging
 import queue
-from datetime import datetime
 
 # ── Configuração de Logs ─────────────────────────────────────
 log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assistant_debug.log")
@@ -33,27 +37,30 @@ logger = logging.getLogger("VoiceAssistant")
 from gui import AssistantGUI
 from ai_engine import AIEngine
 from voice_output import VoiceOutput
-from voice_input import listen, listen_short
+from voice_input import listen, listen_for_interrupt
 from config import (
     WAKE_WORDS,
     WAKE_RESPONSE,
     ASSISTANT_NAME,
     INTERRUPT_PHRASES,
     PAUSE_PHRASES,
-    RESUME_PHRASES,
     SLEEP_AFTER_IDLE,
 )
 
 
-# ── Helpers de Classificação de Comandos ─────────────────────
+# ── Estado global de fala ─────────────────────────────────────
+# Quando True, o loop principal NÃO chama listen() e cede o
+# microfone para a escuta paralela de listen_for_interrupt().
+_is_speaking_flag = threading.Event()
+
+
+# ── Helpers de Classificação ──────────────────────────────────
 
 def _normalize(text: str) -> str:
-    """Remove espaços extras e converte para minúsculas."""
     return text.lower().strip()
 
 
 def is_interrupt_command(text: str) -> bool:
-    """Retorna True se o texto for um comando de parada total."""
     if not text:
         return False
     t = _normalize(text)
@@ -61,23 +68,13 @@ def is_interrupt_command(text: str) -> bool:
 
 
 def is_pause_command(text: str) -> bool:
-    """Retorna True se o texto for um comando de pausa temporária."""
     if not text:
         return False
     t = _normalize(text)
     return any(p in t for p in PAUSE_PHRASES)
 
 
-def is_resume_command(text: str) -> bool:
-    """Retorna True se o texto for um comando para retomar."""
-    if not text:
-        return False
-    t = _normalize(text)
-    return any(p in t for p in RESUME_PHRASES)
-
-
 def is_exit_command(text: str) -> bool:
-    """Retorna True se o texto for um comando de encerramento do sistema."""
     if not text:
         return False
     t = _normalize(text)
@@ -88,50 +85,137 @@ def extract_wake_word_match(text: str):
     """
     Verifica se o texto contém alguma wake word.
     Retorna (wake_word_encontrada, comando_restante) ou (None, None).
-    O comando_restante é o que o usuário disse APÓS a wake word —
-    permite processar "Zerachiel, que horas são?" em um único turno.
+    Testa frases mais longas primeiro para evitar match parcial.
+    Ex: "olá zerachiel me diga a hora" → wake='olá zerachiel', remainder='me diga a hora'
     """
     t = _normalize(text)
-    for wake in sorted(WAKE_WORDS, key=len, reverse=True):  # testa frases mais longas primeiro
+    for wake in sorted(WAKE_WORDS, key=len, reverse=True):
         if wake in t:
-            # Remove a wake word e obtém o restante
-            remainder = t.replace(wake, "", 1).strip(" .,!?")
+            remainder = t.replace(wake, "", 1).strip(" .,!?-")
             return wake, remainder
     return None, None
 
 
-# ── Função Principal ─────────────────────────────────────────
+# ── Função Principal ──────────────────────────────────────────
 
 def main():
     try:
-        # ── Inicialização dos Componentes ────────────────────
         logger.info(f"Iniciando {ASSISTANT_NAME}...")
+
         ai    = AIEngine()
         voice = VoiceOutput()
         app   = AssistantGUI(ai_engine=ai, voice_output=voice)
 
-        # ── Callback de Interrupção Total ────────────────────
+        # ─────────────────────────────────────────────────────
+        # INTERRUPÇÃO TOTAL
+        # ─────────────────────────────────────────────────────
         def do_interrupt():
-            """Para a fala imediatamente e volta ao modo aguardando."""
+            """Para a fala imediatamente e sinaliza fim do SPEAKING."""
             voice.stop()
+            _is_speaking_flag.clear()
             app.set_status("waiting", "Interrompido — pode falar", "yellow")
             logger.info("Interrupção executada.")
 
-        # ── Processamento de Comando pela IA ─────────────────
+        # ─────────────────────────────────────────────────────
+        # FALA COM ESCUTA PARALELA
+        # Chamada dentro de run_ai() (thread separada).
+        # O loop principal verifica _is_speaking_flag e suspende
+        # listen() enquanto esta função estiver ativa.
+        # ─────────────────────────────────────────────────────
+        def speak_with_listener(spoken_text: str):
+            """
+            Fala o texto com escuta paralela para comandos de controle.
+
+            ESTADOS durante esta função:
+              _is_speaking_flag = SET   → loop principal não chama listen()
+              _is_speaking_flag = CLEAR → loop principal volta a ouvir
+
+            COMANDOS reconhecidos durante a fala:
+              - Interrupção ("pare", "chega"...) → para e descarta
+              - Pausa ("espera", "aguarda"...)    → para, mantém AWAKE
+              - Novo comando (qualquer outra coisa > 3 chars) → para e processa
+            """
+            stop_speaking  = threading.Event()
+            new_cmd_buffer = []
+
+            # Sinaliza: estou falando, loop principal suspende listen()
+            _is_speaking_flag.set()
+
+            def voice_thread():
+                voice.speak_raw(spoken_text, stop_event=stop_speaking)
+                stop_speaking.set()          # garante encerramento da listener_thread
+
+            def listener_thread():
+                """
+                Escuta por comandos de controle enquanto o assistente fala.
+                Usa listen_for_interrupt() que tem pause_threshold=0.8s
+                para reagir rapidamente a palavras únicas como "pare".
+                """
+                while not stop_speaking.is_set():
+                    snippet = listen_for_interrupt(timeout_wait=4)
+                    if not snippet:
+                        continue
+
+                    logger.info(f"[Escuta paralela] Capturado: '{snippet}'")
+
+                    # Interrupção total
+                    if is_interrupt_command(snippet):
+                        stop_speaking.set()
+                        voice.stop()
+                        do_interrupt()
+                        return
+
+                    # Pausa temporária — para a fala mas mantém AWAKE
+                    if is_pause_command(snippet):
+                        stop_speaking.set()
+                        voice.stop()
+                        _is_speaking_flag.clear()
+                        app.set_status("waiting", "⏸ Pausado — pode perguntar", "yellow")
+                        app.add_message("status", "Pausado. Pode fazer outra pergunta.")
+                        logger.info("Fala pausada pelo usuário.")
+                        return
+
+                    # Novo comando durante a fala → interrompe e processa
+                    if len(snippet) > 3:
+                        stop_speaking.set()
+                        voice.stop()
+                        new_cmd_buffer.append(snippet)
+                        logger.info(f"[Escuta paralela] Novo comando: '{snippet}'")
+                        return
+
+            t_voice    = threading.Thread(target=voice_thread,    daemon=True)
+            t_listener = threading.Thread(target=listener_thread, daemon=True)
+
+            t_voice.start()
+            t_listener.start()
+            t_voice.join()          # aguarda fim do áudio ou interrupção
+            stop_speaking.set()     # encerra listener_thread se ainda estiver rodando
+
+            # Libera o microfone para o loop principal
+            _is_speaking_flag.clear()
+            logger.debug("SPEAKING encerrado — microfone devolvido ao loop principal.")
+
+            # Se um novo comando foi capturado durante a fala, processa
+            if new_cmd_buffer:
+                process_command(new_cmd_buffer[0])
+
+        # ─────────────────────────────────────────────────────
+        # PROCESSAMENTO DE COMANDO
+        # ─────────────────────────────────────────────────────
         def process_command(user_text: str):
             """
-            Envia o texto para a IA, recebe (spoken, display),
-            exibe na GUI e fala a resposta com escuta paralela.
+            Envia o comando para a IA e fala a resposta.
+            Roda em thread separada para não bloquear o loop principal.
             """
             if not user_text or not user_text.strip():
                 return
 
-            # Comando especial de saída
+            # Comando de saída
             if is_exit_command(user_text):
-                final_msg = "Encerrando o sistema. Até logo!"
-                app.add_message("assistant", final_msg)
+                msg = "Encerrando o sistema. Até logo!"
+                app.add_message("assistant", msg)
                 app.set_status("speaking", "Saindo...", "red")
-                voice.speak(final_msg)
+                voice.speak(msg)
                 time.sleep(2)
                 app.on_closing()
                 return
@@ -144,90 +228,31 @@ def main():
                     spoken, display = ai.process(user_text)
                     display_text = display or spoken
 
-                    # Exibe na GUI
                     app.add_message("assistant", display_text)
                     app.set_status("speaking", f"{ASSISTANT_NAME} falando...", "purple")
 
-                    # Fala com escuta paralela por interrupção/pausa/novo comando
+                    # Fala com escuta paralela (suspende loop principal via flag)
                     speak_with_listener(spoken)
 
-                    # Registra no histórico da IA
                     ai.add_to_history(user_text, spoken)
                     app.set_status("waiting", "Pode falar...", "green")
 
                 except Exception as e:
                     logger.error(f"Erro na IA: {e}", exc_info=True)
-                    app.set_status("waiting", "Erro no processamento", "red")
+                    _is_speaking_flag.clear()
+                    app.set_status("waiting", "Erro — pode falar novamente", "red")
 
             threading.Thread(target=run_ai, daemon=True).start()
 
-        # ── Fala com Escuta Paralela (Etapa 2) ───────────────
-        def speak_with_listener(spoken_text: str):
-            """
-            Fala o texto enquanto uma thread paralela escuta por:
-              - Comando de PAUSA  → para o áudio, mantém AWAKE, aguarda instrução
-              - Comando de INTERRUPT → para o áudio e limpa estado
-              - Novo COMANDO      → para o áudio e processa o novo pedido
-
-            Diferença pausa vs interrupção:
-              - Pausa:       para a fala, aguarda "continue" ou novo comando
-              - Interrupção: para a fala e DESCARTA o contexto (como antes)
-            """
-            stop_speaking   = threading.Event()
-            new_cmd_buffer  = []   # armazena novo comando capturado durante a fala
-
-            def voice_thread():
-                """Reproduz o áudio e verifica stop_speaking a cada 0.1s."""
-                voice.speak_raw(spoken_text, stop_event=stop_speaking)
-
-            def listener_thread():
-                """Escuta com timeout curto enquanto o assistente fala."""
-                while not stop_speaking.is_set():
-                    snippet = listen_short(timeout_wait=2)
-                    if not snippet:
-                        continue
-
-                    logger.info(f"[Escuta paralela] Capturado: '{snippet}'")
-
-                    if is_interrupt_command(snippet):
-                        stop_speaking.set()
-                        voice.stop()
-                        do_interrupt()
-                        return
-
-                    if is_pause_command(snippet):
-                        stop_speaking.set()
-                        voice.stop()
-                        app.set_status("waiting", "⏸ Pausado — pode perguntar", "yellow")
-                        app.add_message("status", "Fala pausada. Pode fazer outra pergunta.")
-                        logger.info("Fala pausada pelo usuário.")
-                        # Fica aguardando um novo comando (sem sair do loop principal)
-                        return
-
-                    # Novo comando durante a fala: para e processa
-                    if len(snippet) > 3:
-                        stop_speaking.set()
-                        voice.stop()
-                        new_cmd_buffer.append(snippet)
-                        return
-
-            t_voice    = threading.Thread(target=voice_thread,    daemon=True)
-            t_listener = threading.Thread(target=listener_thread, daemon=True)
-
-            t_voice.start()
-            t_listener.start()
-            t_voice.join()      # espera o áudio terminar (ou ser interrompido)
-            stop_speaking.set() # garante que listener_thread encerra junto
-
-            # Se um novo comando foi capturado durante a fala, processa agora
-            if new_cmd_buffer:
-                process_command(new_cmd_buffer[0])
-
-        # ── Loop Principal de Escuta ──────────────────────────
+        # ─────────────────────────────────────────────────────
+        # LOOP PRINCIPAL DE ESCUTA
+        # ─────────────────────────────────────────────────────
         def assistant_loop():
             """
-            Thread permanente que gerencia a máquina de estados:
-              SLEEPING → AWAKE → processa comandos → auto-sleep
+            Máquina de estados principal.
+            SLEEPING → aguarda wake word.
+            AWAKE    → processa comandos.
+            SPEAKING → suspende listen(); escuta paralela assume.
             """
             logger.info("Thread de monitoramento iniciada.")
 
@@ -247,16 +272,20 @@ def main():
                 except queue.Empty:
                     pass
 
+                # ── Suspende durante SPEAKING ─────────────────
+                # O loop principal não chama listen() enquanto o assistente
+                # fala — cede o microfone para listen_for_interrupt().
+                if _is_speaking_flag.is_set():
+                    time.sleep(0.1)   # poll leve, não bloqueia a GUI
+                    continue
+
                 # ── Auto-sleep por inatividade ────────────────
                 if is_awake and (time.time() - last_activity > SLEEP_AFTER_IDLE):
                     is_awake = False
                     logger.info("Zerachiel voltou ao modo standby (inatividade).")
                     app.set_status("waiting", f"Diga '{WAKE_WORDS[0]}'...", "green")
 
-                # ── Verifica se botão GUI foi clicado ─────────
-                # O botão "Iniciar Zerachiel" chama activate_assistant(),
-                # que define o status para "Zerachiel: Pronto".
-                # Isso acorda o assistente sem precisar da wake word.
+                # ── Verifica ativação via botão GUI ───────────
                 try:
                     current_status = app.status_label.cget("text")
                     if "Zerachiel: Pronto" in current_status and not is_awake:
@@ -272,12 +301,12 @@ def main():
                 else:
                     app.set_status("waiting", f"Diga '{WAKE_WORDS[0]}'...", "green")
 
-                # ── Escuta um turno de fala ───────────────────
-                # Bloqueia até detectar pausa longa ou timeout
+                # ── Escuta um turno completo ──────────────────
+                # listen() usa pause_threshold=2.5s → aguarda pausa longa
+                # para considerar o turno encerrado.
                 recognized = listen()
 
                 if not recognized:
-                    # Ninguém falou — atualiza status e volta ao topo do loop
                     status_txt = "Pode falar..." if is_awake else f"Diga '{WAKE_WORDS[0]}'..."
                     app.set_status("waiting", status_txt, "green")
                     continue
@@ -298,33 +327,30 @@ def main():
                         last_activity = time.time()
                         logger.info(f"Wake word detectada: '{matched_wake}'")
 
-                        # Verifica se há comando junto com a wake word
-                        # Ex: "Zerachiel, que horas são?" → processa "que horas são?"
                         if remainder and len(remainder) > 3:
+                            # Wake word + comando na mesma fala → processa tudo
                             logger.info(f"Comando junto à wake word: '{remainder}'")
-                            # Responde brevemente e já processa o comando
                             app.add_message("assistant", WAKE_RESPONSE)
-                            def greet_and_process(cmd=remainder):
+                            def _greet_and_process(cmd=remainder):
                                 voice.speak(WAKE_RESPONSE)
                                 process_command(cmd)
-                            threading.Thread(target=greet_and_process, daemon=True).start()
+                            threading.Thread(target=_greet_and_process, daemon=True).start()
                         else:
-                            # Só wake word, sem comando: responde e aguarda
+                            # Só wake word → responde e aguarda próximo turno
                             app.add_message("assistant", WAKE_RESPONSE)
                             threading.Thread(
                                 target=lambda: voice.speak(WAKE_RESPONSE),
                                 daemon=True
                             ).start()
                     else:
-                        # Texto captado mas sem wake word — ignora silenciosamente
                         logger.debug(f"Ignorado (modo dormindo, sem wake word): '{recognized}'")
                     continue
 
-                # ── MODO ACORDADO: processa qualquer comando ──
+                # ── MODO ACORDADO: processa o comando ─────────
                 last_activity = time.time()
                 process_command(recognized)
 
-        # ── Inicia Threads e GUI ──────────────────────────────
+        # ── Inicia tudo ───────────────────────────────────────
         threading.Thread(target=assistant_loop, daemon=True).start()
         app.mainloop()
 

@@ -34,6 +34,70 @@ from config import (
 logger = logging.getLogger("VoiceAssistant")
 
 
+def _normalize_dir_key(text: str) -> str:
+    """
+    Normaliza uma string de diretório para comparação com ALLOWED_DIRS.
+
+    Problema: o Google STT transcreve "área de trabalho" de formas variadas,
+    e a IA normaliza antes de chamar a tool (remove acentos, usa underscores).
+    Esta função trata TODAS as variações conhecidas:
+      "área de trabalho" → "area de trabalho"
+      "area_de_trabalho" → "area de trabalho"
+      "Área De Trabalho"  → "area de trabalho"
+    """
+    import unicodedata
+    # Lowercase
+    text = text.lower().strip()
+    # Remove acentos (NFD → elimina diacríticos)
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    # Substitui underscores e hífens por espaço
+    text = text.replace("_", " ").replace("-", " ")
+    # Normaliza espaços extras
+    text = " ".join(text.split())
+    return text
+
+
+def _resolve_directory(directory: str) -> str | None:
+    """
+    Resolve um nome/alias de diretório para o caminho absoluto correspondente.
+
+    Tenta primeiro a chave original, depois a versão normalizada (sem acentos,
+    sem underscores). Se nenhuma bater nos aliases, tenta como caminho absoluto
+    dentro das pastas permitidas.
+
+    Retorna o caminho resolvido ou None se não for permitido.
+    """
+    if not directory:
+        return None
+
+    # Tenta chave exata (case insensitive)
+    key_lower = directory.lower().strip()
+    if key_lower in ALLOWED_DIRS:
+        return ALLOWED_DIRS[key_lower]
+
+    # Tenta chave normalizada (sem acentos, underscores → espaços)
+    key_norm = _normalize_dir_key(directory)
+    if key_norm in ALLOWED_DIRS:
+        return ALLOWED_DIRS[key_norm]
+
+    # Tenta todas as chaves do dicionário também normalizadas
+    for alias, path in ALLOWED_DIRS.items():
+        if _normalize_dir_key(alias) == key_norm:
+            return path
+
+    # Última tentativa: caminho absoluto dentro das pastas permitidas
+    try:
+        abs_try = os.path.realpath(directory)
+        allowed_roots = [os.path.realpath(d) for d in ALLOWED_DIRS.values()]
+        if any(abs_try.startswith(root) for root in allowed_roots):
+            return abs_try
+    except Exception:
+        pass
+
+    return None
+
+
 class AIEngine:
     """
     Motor de IA do Zerachiel.
@@ -127,35 +191,28 @@ class AIEngine:
 
         # ── Resolve o diretório de destino ───────────────────
         if directory:
-            dir_key = directory.lower().strip()
-            # Verifica aliases conhecidos (documentos, desktop, downloads, sandbox)
-            resolved_dir = ALLOWED_DIRS.get(dir_key)
-
+            resolved_dir = _resolve_directory(directory)
             if not resolved_dir:
-                # Tentativa de caminho absoluto — verifica se está dentro dos permitidos
-                abs_try = os.path.realpath(directory)
-                allowed_roots = [os.path.realpath(d) for d in ALLOWED_DIRS.values()]
-                if any(abs_try.startswith(root) for root in allowed_roots):
-                    resolved_dir = abs_try
-                else:
-                    return (
-                        f"Pasta '{directory}' não é permitida. "
-                        f"Use: {', '.join(ALLOWED_DIRS.keys())}."
-                    )
+                return (
+                    f"Pasta '{directory}' não é permitida. "
+                    "Use: 'desktop', 'documentos', 'downloads' ou 'sandbox'."
+                )
         else:
             resolved_dir = BASE_SANDBOX   # pasta padrão segura
 
         # ── Sanitização do nome do arquivo ───────────────────
-        # Remove caracteres inválidos em nomes de arquivo Windows/Linux
-        safe_filename = re.sub(r'[\\/:*?"<>|]', "_", filename).strip()
-        if not safe_filename:
-            return "Nome de arquivo inválido."
+        # Remove caracteres inválidos em nomes de arquivo Windows/Linux.
+        # Para a ação "list", filename pode ser vazio — é aceitável.
+        safe_filename = re.sub(r'[\\/:*?"<>|]', "_", filename).strip() if filename else ""
 
-        # ── Verifica path traversal ───────────────────────────
-        filepath  = os.path.realpath(os.path.join(resolved_dir, safe_filename))
+        if not safe_filename and action not in ("list",):
+            return f"Nome de arquivo é obrigatório para a ação '{action}'."
+
+        # ── Verifica path traversal (só quando há filename) ──
+        filepath  = os.path.realpath(os.path.join(resolved_dir, safe_filename)) if safe_filename else None
         real_base = os.path.realpath(resolved_dir)
 
-        if not filepath.startswith(real_base):
+        if filepath and not filepath.startswith(real_base):
             logger.warning(f"[file_manager] Tentativa de path traversal bloqueada: {filepath}")
             return "Acesso negado: caminho de arquivo inválido ou fora da área permitida."
 
@@ -259,11 +316,21 @@ class AIEngine:
     def _call_groq(self, user_input: str) -> str:
         """
         Envia a mensagem para a API Groq com suporte a function calling.
-        Faz segunda chamada se a IA decidir usar uma ferramenta.
+
+        IMPORTANTE sobre histórico e tool_calls:
+        O Groq exige que se o histórico contiver uma mensagem do assistente
+        com tool_calls, a próxima mensagem DEVE ser um tool_result com o
+        mesmo tool_call_id. Por isso o histórico de conversa armazena APENAS
+        o texto final da resposta (sem o ciclo de tool_calls) — o ciclo
+        de ferramentas acontece só dentro desta função, em mensagens
+        temporárias que nunca entram em self.conversation_history.
         """
         messages = self._build_messages(user_input)
         url      = "https://api.groq.com/openai/v1/chat/completions"
-        headers  = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+        headers  = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type":  "application/json",
+        }
 
         payload = {
             "model":       GROQ_MODEL,
@@ -274,42 +341,74 @@ class AIEngine:
             "max_tokens":  1024,
         }
 
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
-        resp.raise_for_status()
+        try:
+            resp = requests.post(url, headers=headers, json=payload, timeout=30)
+            if not resp.ok:
+                # Loga o body completo do erro para diagnóstico
+                logger.error(f"[Groq] Erro {resp.status_code}: {resp.text[:500]}")
+                resp.raise_for_status()
+        except requests.HTTPError:
+            raise
+
         data    = resp.json()
         message = data["choices"][0]["message"]
 
-        # ── Verifica se a IA quer usar uma ferramenta ────────
-        if message.get("tool_calls"):
-            tool_call = message["tool_calls"][0]
-            tool_name = tool_call["function"]["name"]
-            try:
-                arguments = json.loads(tool_call["function"]["arguments"])
-            except json.JSONDecodeError:
-                arguments = {}
+        # ── Sem tool_calls: retorna a resposta direta ────────
+        if not message.get("tool_calls"):
+            return message.get("content", "")
 
-            logger.info(f"[Groq] Tool call: {tool_name}({arguments})")
-            tool_result = self._execute_tool(tool_name, arguments)
+        # ── Com tool_calls: executa a ferramenta ─────────────
+        # Este ciclo usa uma lista de mensagens TEMPORÁRIA (msgs_with_tool)
+        # que nunca é gravada em self.conversation_history.
+        # Isso evita o erro 400 (tool_result sem tool_call correspondente).
 
-            # Segunda chamada com o resultado da ferramenta
-            messages.append(message)
-            messages.append({
+        tool_call  = message["tool_calls"][0]
+        tool_name  = tool_call["function"]["name"]
+        tool_call_id = tool_call["id"]
+
+        try:
+            arguments = json.loads(tool_call["function"]["arguments"])
+        except (json.JSONDecodeError, KeyError):
+            arguments = {}
+
+        logger.info(f"[Groq] Tool call: {tool_name}({arguments})")
+        tool_result = self._execute_tool(tool_name, arguments)
+
+        # Monta ciclo completo só para esta chamada — NÃO vai pro histórico
+        msgs_with_tool = messages + [
+            # Mensagem do assistente COM tool_calls (obrigatória antes do tool_result)
+            {
+                "role":       "assistant",
+                "content":    None,          # Groq exige None quando há tool_calls
+                "tool_calls": message["tool_calls"],
+            },
+            # Resultado da ferramenta
+            {
                 "role":         "tool",
-                "tool_call_id": tool_call["id"],
+                "tool_call_id": tool_call_id,
                 "name":         tool_name,
-                "content":      tool_result,
-            })
+                "content":      str(tool_result),
+            },
+        ]
 
+        payload_final = {
+            "model":      GROQ_MODEL,
+            "messages":   msgs_with_tool,
+            "max_tokens": 1024,
+            # Sem tools na segunda chamada — só queremos o texto final
+        }
+
+        try:
             resp_final = requests.post(
-                url,
-                headers=headers,
-                json={"model": GROQ_MODEL, "messages": messages, "max_tokens": 1024},
-                timeout=30,
+                url, headers=headers, json=payload_final, timeout=30
             )
-            resp_final.raise_for_status()
-            return resp_final.json()["choices"][0]["message"]["content"]
+            if not resp_final.ok:
+                logger.error(f"[Groq] Erro na 2ª chamada {resp_final.status_code}: {resp_final.text[:500]}")
+                resp_final.raise_for_status()
+        except requests.HTTPError:
+            raise
 
-        return message["content"]
+        return resp_final.json()["choices"][0]["message"]["content"]
 
     # ══════════════════════════════════════════════════════════
     # MOTOR OLLAMA (fallback local)
