@@ -1,14 +1,5 @@
 # ============================================================
-# main_gui.py — Orquestrador Principal do Zerachiel v3.3
-#
-# CORREÇÕES v3.3:
-#   1. is_exit_command usa EXIT_PHRASES do config — frases completas
-#      exigidas para evitar encerramento acidental ao mencionar
-#      "encerrar" em qualquer contexto de conversa.
-#   2. listener_thread na escuta paralela NÃO processa comandos
-#      muito curtos (< 6 chars) capturados pelo microfone ambiente.
-#   3. Fragmentos capturados durante SPEAKING são descartados se
-#      contiverem palavras de comando parciais sem contexto.
+# main_gui.py — Orquestrador Neural v3.9 (Windows)
 # ============================================================
 
 import sys
@@ -17,15 +8,14 @@ import threading
 import time
 import logging
 import queue
+import asyncio
 
+# Configuração de Logs
 log_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assistant_debug.log")
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(log_file, encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=[logging.FileHandler(log_file, encoding="utf-8"), logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("VoiceAssistant")
 
@@ -33,283 +23,104 @@ from gui import AssistantGUI
 from ai_engine import AIEngine
 from voice_output import VoiceOutput
 from voice_input import listen, listen_for_interrupt
-from config import (
-    WAKE_WORDS,
-    WAKE_RESPONSE,
-    ASSISTANT_NAME,
-    INTERRUPT_PHRASES,
-    PAUSE_PHRASES,
-    EXIT_PHRASES,
-    SLEEP_AFTER_IDLE,
-)
+from config import WAKE_WORDS, WAKE_RESPONSE, ASSISTANT_NAME, INTERRUPT_PHRASES
 
-# Flag global: True = assistente falando, loop principal suspende listen()
 _is_speaking_flag = threading.Event()
-
-
-# ── Helpers ──────────────────────────────────────────────────
-
-def _normalize(text: str) -> str:
-    return text.lower().strip()
-
-
-def is_interrupt_command(text: str) -> bool:
-    if not text:
-        return False
-    t = _normalize(text)
-    return any(p in t for p in INTERRUPT_PHRASES)
-
-
-def is_pause_command(text: str) -> bool:
-    if not text:
-        return False
-    t = _normalize(text)
-    return any(p in t for p in PAUSE_PHRASES)
-
-
-def is_exit_command(text: str) -> bool:
-    """
-    CORRIGIDO v3.3: exige frases completas de EXIT_PHRASES.
-    Antes: checava só 'encerrar' ou 'finalizar' → encerrava ao
-    falar 'escreva um programa para encerrar processo' etc.
-    Agora: só encerra com 'ok assistente encerrar', 'finalizar zerachiel', etc.
-    """
-    if not text:
-        return False
-    t = _normalize(text)
-    return any(phrase in t for phrase in EXIT_PHRASES)
-
-
-def extract_wake_word_match(text: str):
-    t = _normalize(text)
-    for wake in sorted(WAKE_WORDS, key=len, reverse=True):
-        if wake in t:
-            remainder = t.replace(wake, "", 1).strip(" .,!?-")
-            return wake, remainder
-    return None, None
-
-
-# ── Main ──────────────────────────────────────────────────────
 
 def main():
     try:
-        logger.info(f"Iniciando {ASSISTANT_NAME}...")
+        if sys.platform == 'win32':
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-        ai    = AIEngine()
+        ai = AIEngine()
         voice = VoiceOutput()
-        app   = AssistantGUI(ai_engine=ai, voice_output=voice)
+        app = AssistantGUI(ai_engine=ai, voice_output=voice)
 
-        def do_interrupt():
-            voice.stop()
-            _is_speaking_flag.clear()
-            app.set_status("waiting", "Interrompido — pode falar", "#ff9900")
-            logger.info("Interrupção executada.")
-
-        # ── Fala com escuta paralela ──────────────────────────
-        def speak_with_listener(spoken_text: str):
-            stop_speaking  = threading.Event()
-            new_cmd_buffer = []
+        def speak_with_listener(text):
+            if app.pause_speaking_event.is_set(): return # Respeita pausa de fala
+            
+            stop_ev = threading.Event()
             _is_speaking_flag.set()
+            app.set_status("speaking", "SISTEMA TRANSMITINDO...", "#00f5ff")
 
-            def voice_thread():
-                voice.speak_raw(spoken_text, stop_event=stop_speaking)
-                stop_speaking.set()
-
-            def listener_thread():
-                while not stop_speaking.is_set():
-                    snippet = listen_for_interrupt(timeout_wait=4)
-                    if not snippet:
-                        continue
-
-                    logger.info(f"[Escuta paralela] Capturado: '{snippet}'")
-
-                    # Descarta fragmentos muito curtos — ruído ou eco do alto-falante
-                    if len(snippet) < 4:
-                        logger.debug(f"[Escuta paralela] Descartado (muito curto): '{snippet}'")
-                        continue
-
-                    if is_interrupt_command(snippet):
-                        stop_speaking.set()
-                        voice.stop()
-                        do_interrupt()
-                        return
-
-                    if is_pause_command(snippet):
-                        stop_speaking.set()
-                        voice.stop()
-                        _is_speaking_flag.clear()
-                        app.set_status("waiting", "⏸ Pausado — pode perguntar", "#ff9900")
-                        app.add_message("status", "Pausado. Pode fazer outra pergunta.")
-                        logger.info("Fala pausada pelo usuário.")
-                        return
-
-                    # Novo comando durante fala: mínimo 8 chars para evitar
-                    # fragmentos aleatórios do áudio ambiente serem processados
-                    if len(snippet) >= 8:
-                        stop_speaking.set()
-                        voice.stop()
-                        new_cmd_buffer.append(snippet)
-                        logger.info(f"[Escuta paralela] Novo comando: '{snippet}'")
-                        return
-                    else:
-                        logger.debug(f"[Escuta paralela] Descartado (fragmento curto): '{snippet}'")
-
-            t_voice    = threading.Thread(target=voice_thread,    daemon=True)
-            t_listener = threading.Thread(target=listener_thread, daemon=True)
-            t_voice.start()
-            t_listener.start()
-            t_voice.join()
-            stop_speaking.set()
-            _is_speaking_flag.clear()
-            logger.debug("SPEAKING encerrado — microfone devolvido ao loop principal.")
-
-            if new_cmd_buffer:
-                process_command(new_cmd_buffer[0])
-
-        # ── Processamento de Comando ──────────────────────────
-        def process_command(user_text: str):
-            if not user_text or not user_text.strip():
-                return
-
-            if is_exit_command(user_text):
-                msg = "Encerrando o sistema. Até logo!"
-                app.add_message("assistant", msg)
-                app.set_status("speaking", "Saindo...", "#ff003c")
-                voice.speak(msg)
-                time.sleep(2)
-                app.on_closing()
-                return
-
-            app.add_message("user", user_text)
-            app.set_status("thinking", f"{ASSISTANT_NAME} processando...", "#4488ff")
-
-            def run_ai():
+            def v_thread():
                 try:
-                    spoken, display = ai.process(user_text)
-                    display_text = display or spoken
-                    app.add_message("assistant", display_text)
-                    app.set_status("speaking", f"{ASSISTANT_NAME} falando...", "#bf00ff")
-                    speak_with_listener(spoken)
-                    ai.add_to_history(user_text, spoken)
-                    app.set_status("waiting", "Pode falar...", "#00ff88")
-                except Exception as e:
-                    logger.error(f"Erro na IA: {e}", exc_info=True)
+                    voice.speak_raw(text, stop_event=stop_ev)
+                finally:
+                    stop_ev.set()
                     _is_speaking_flag.clear()
-                    app.set_status("waiting", "Erro — pode falar novamente", "#ff003c")
+                    app.set_status("waiting", "SISTEMA PRONTO", "#00ff88")
 
-            threading.Thread(target=run_ai, daemon=True).start()
+            def l_thread():
+                while not stop_ev.is_set():
+                    if app.pause_listening_event.is_set():
+                        time.sleep(0.5); continue
+                    snip = listen_for_interrupt()
+                    if snip and any(p in snip.lower() for p in INTERRUPT_PHRASES + ["ok assistente", "pare"]):
+                        stop_ev.set()
+                        voice.stop()
+                        break
 
-        # ── Loop Principal ────────────────────────────────────
-        def assistant_loop():
-            logger.info("Thread de monitoramento iniciada.")
-            is_awake      = False
-            last_activity = time.time()
+            threading.Thread(target=v_thread, daemon=True).start()
+            threading.Thread(target=l_thread, daemon=True).start()
 
+        def process_command(txt, from_typing=False):
+            if not txt: return
+            if not from_typing: app.add_message("user", txt)
+            app.set_status("thinking", "PROCESSANDO NEURAL...", "#4488ff")
+            
+            def run():
+                try:
+                    spoken, display = ai.process(txt)
+                    app.update_engine(ai.current_engine)
+                    app.add_message("assistant", display or spoken)
+                    speak_with_listener(spoken)
+                    ai.add_to_history(txt, spoken)
+                except Exception as e:
+                    logger.error(f"Erro no processamento: {e}")
+                    app.add_message("assistant", "ERRO DE CONEXÃO NEURAL.")
+            
+            threading.Thread(target=run, daemon=True).start()
+
+        def background_loop():
+            is_awake = False
             while not app.stop_event.is_set():
-
-                # Prioridade 1: texto digitado na GUI
-                # Digitar qualquer coisa acorda o assistente automaticamente
-                # sem precisar clicar no botão Iniciar ou falar wake word
                 try:
-                    cmd_text = app.command_queue.get_nowait()
-                    if cmd_text and cmd_text.strip():
-                        if not is_awake:
+                    # Comandos da Fila (Texto)
+                    try:
+                        t = app.command_queue.get_nowait()
+                        if t: 
                             is_awake = True
-                            logger.info("Zerachiel acordado via texto digitado.")
-                            app.set_status("waiting", "Zerachiel: Pronto", "#00ff88")
-                            # Atualiza botão se ainda não foi clicado
-                            try:
-                                app.after(0, lambda: app.start_button.configure(
-                                    state="disabled",
-                                    text="◉  ATIVO",
-                                    text_color="#00f5ff",
-                                    border_color="#00f5ff",
-                                ))
-                            except Exception:
-                                pass
-                        last_activity = time.time()
-                        process_command(cmd_text)
-                        continue
-                except queue.Empty:
-                    pass
+                            process_command(t, from_typing=True)
+                            continue
+                    except queue.Empty: pass
 
-                # Suspende durante SPEAKING
-                if _is_speaking_flag.is_set():
-                    time.sleep(0.1)
-                    continue
+                    if _is_speaking_flag.is_set():
+                        time.sleep(0.1); continue
 
-                # Auto-sleep
-                if is_awake and (time.time() - last_activity > SLEEP_AFTER_IDLE):
-                    is_awake = False
-                    logger.info("Zerachiel voltou ao modo standby.")
-                    app.set_status("waiting", f"Diga '{WAKE_WORDS[0]}'...", "#00ff88")
-
-                # Ativação via botão GUI
-                try:
-                    if "Zerachiel: Pronto" in app.status_label.cget("text") and not is_awake:
-                        is_awake      = True
-                        last_activity = time.time()
-                        logger.info("Zerachiel acordado via botão GUI.")
-                except Exception:
-                    pass
-
-                # Status visual
-                if is_awake:
-                    app.set_status("listening", "Ouvindo...", "#ff003c")
-                else:
-                    app.set_status("waiting", f"Diga '{WAKE_WORDS[0]}'...", "#00ff88")
-
-                # Escuta turno completo
-                recognized = listen()
-
-                if not recognized:
-                    status_txt = "Pode falar..." if is_awake else f"Diga '{WAKE_WORDS[0]}'..."
-                    app.set_status("waiting", status_txt, "#00ff88")
-                    continue
-
-                logger.info(f"Microfone captou: '{recognized}'")
-
-                # Interrupção tem prioridade
-                if is_interrupt_command(recognized):
-                    do_interrupt()
-                    continue
-
-                # MODO DORMINDO
-                if not is_awake:
-                    matched_wake, remainder = extract_wake_word_match(recognized)
-                    if matched_wake:
-                        is_awake      = True
-                        last_activity = time.time()
-                        logger.info(f"Wake word detectada: '{matched_wake}'")
-                        if remainder and len(remainder) > 3:
-                            logger.info(f"Comando junto à wake word: '{remainder}'")
-                            app.add_message("assistant", WAKE_RESPONSE)
-                            def _greet_and_process(cmd=remainder):
-                                voice.speak(WAKE_RESPONSE)
-                                process_command(cmd)
-                            threading.Thread(target=_greet_and_process, daemon=True).start()
-                        else:
-                            app.add_message("assistant", WAKE_RESPONSE)
-                            threading.Thread(
-                                target=lambda: voice.speak(WAKE_RESPONSE),
-                                daemon=True
-                            ).start()
+                    # Escuta por Voz
+                    if not app.pause_listening_event.is_set():
+                        app.set_status("listening" if is_awake else "waiting", "ESCUTANDO..." if is_awake else "AGUARDANDO...", "#ff003c" if is_awake else "#00ff88")
+                        rec = listen()
+                        if rec:
+                            if not is_awake:
+                                if any(w in rec.lower() for w in WAKE_WORDS):
+                                    is_awake = True
+                                    app.add_message("assistant", WAKE_RESPONSE)
+                                    voice.speak(WAKE_RESPONSE)
+                            else:
+                                process_command(rec)
                     else:
-                        logger.debug(f"Ignorado (dormindo, sem wake word): '{recognized}'")
-                    continue
+                        # Se pausado, apenas aguarda um pouco
+                        time.sleep(0.5)
+                except Exception as e:
+                    logger.error(f"Erro no loop: {e}")
+                    time.sleep(0.5)
 
-                # MODO ACORDADO
-                last_activity = time.time()
-                process_command(recognized)
-
-        threading.Thread(target=assistant_loop, daemon=True).start()
+        threading.Thread(target=background_loop, daemon=True).start()
         app.mainloop()
-
     except Exception as e:
-        logger.critical(f"FALHA CRÍTICA: {e}", exc_info=True)
-    finally:
-        logger.info("Aplicação finalizada.")
-
+        logger.critical(f"FALHA CRÍTICA: {e}")
 
 if __name__ == "__main__":
     main()
