@@ -1,5 +1,5 @@
 # ============================================================
-# ai_engine.py — Motor de IA Ultra-Resiliente (v3.8)
+# ai_engine.py — Motor de IA Ultra-Resiliente (v4.0)
 # ============================================================
 
 import re
@@ -8,6 +8,7 @@ import json
 import requests
 import logging
 import unicodedata
+from tkinter import messagebox
 from config import (
     ASSISTANT_NAME,
     AI_ENGINE,
@@ -19,7 +20,6 @@ from config import (
     GEMINI_MODEL,
     SYSTEM_PROMPT,
     TOOLS_DEFINITION,
-    BASE_SANDBOX,
     ALLOWED_DIRS,
 )
 
@@ -48,28 +48,27 @@ class AIEngine:
         self.current_engine = "GEMINI"
         self._last_response = ""
 
-    def _web_search(self, query: str) -> str:
-        try:
-            url = "https://api.duckduckgo.com/"
-            params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}
-            resp = requests.get(url, params=params, timeout=10)
-            data = resp.json()
-            return data.get("AbstractText", "Sem resultados diretos.")[:800]
-        except: return "Erro na busca."
-
     def _file_manager(self, action: str, filename: str = "", content: str = "", directory: str = "") -> str:
         resolved_dir = _resolve_directory(directory)
         safe_filename = re.sub(r'[\\/:*?"<>|]', "_", filename).strip()
         if not safe_filename: return "ERRO: Nome de arquivo inválido."
-        if "." not in safe_filename: safe_filename += ".txt"
         
         filepath = os.path.join(resolved_dir, safe_filename)
         os.makedirs(resolved_dir, exist_ok=True)
 
+        # SEGURANÇA: Pede permissão se o arquivo já existir para ações de escrita
+        if action in ["create", "edit", "append"] and os.path.exists(filepath):
+            import tkinter as tk
+            from tkinter import messagebox
+            root = tk.Tk(); root.withdraw()
+            ans = messagebox.askyesno("Permissão de Arquivo", f"O arquivo '{safe_filename}' já existe. Deseja permitir a alteração?")
+            root.destroy()
+            if not ans: return "ERRO: Permissão negada pelo usuário."
+
         try:
             if action in ["create", "edit"]:
                 with open(filepath, "w", encoding="utf-8") as f: f.write(content)
-                logger.info(f"ARQUIVO CRIADO: {filepath}")
+                logger.info(f"ARQUIVO OPERADO: {filepath}")
                 return f"SUCESSO: Arquivo '{safe_filename}' salvo no Desktop."
             elif action == "append":
                 with open(filepath, "a", encoding="utf-8") as f: f.write("\n" + content)
@@ -84,7 +83,13 @@ class AIEngine:
         return "Ação inválida."
 
     def _execute_tool(self, tool_name: str, arguments: dict) -> str:
-        if tool_name == "web_search": return self._web_search(arguments.get("query", ""))
+        if tool_name == "web_search":
+            try:
+                url = "https://api.duckduckgo.com/"
+                params = {"q": arguments.get("query", ""), "format": "json", "no_html": "1", "skip_disambig": "1"}
+                resp = requests.get(url, params=params, timeout=10)
+                return resp.json().get("AbstractText", "Sem resultados.")[:800]
+            except: return "Erro na busca."
         if tool_name == "file_manager": return self._file_manager(**arguments)
         return "Ferramenta não encontrada."
 
@@ -98,7 +103,7 @@ class AIEngine:
         contents.append({"role": "user", "parts": [{"text": user_input}]})
         
         payload = {
-            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT + " SE O USUÁRIO PEDIR PARA CRIAR UM ARQUIVO, USE A FERRAMENTA file_manager OBRIGATORIAMENTE."}]},
+            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT + " SEJA CRITERIOSO: Só crie arquivos se o usuário pedir explicitamente. Para analisar anexos, use o conteúdo fornecido."}]},
             "contents": contents,
             "tools": [{"functionDeclarations": [t["function"] for t in TOOLS_DEFINITION]}]
         }
@@ -128,18 +133,12 @@ class AIEngine:
         self.current_engine = "GROQ"
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-        messages = [{"role": "system", "content": SYSTEM_PROMPT + " SE O USUÁRIO PEDIR PARA CRIAR UM ARQUIVO, USE A FERRAMENTA file_manager OBRIGATORIAMENTE."}]
+        messages = [{"role": "system", "content": SYSTEM_PROMPT + " SEJA CRITERIOSO: Só crie arquivos se o usuário pedir explicitamente."}]
         for h in self.conversation_history[-5:]:
             messages.extend([{"role": "user", "content": h["user"]}, {"role": "assistant", "content": h["assistant"]}])
         messages.append({"role": "user", "content": user_input})
         
-        payload = {
-            "model": GROQ_MODEL,
-            "messages": messages,
-            "tools": TOOLS_DEFINITION,
-            "tool_choice": "auto"
-        }
-        
+        payload = {"model": GROQ_MODEL, "messages": messages, "tools": TOOLS_DEFINITION, "tool_choice": "auto"}
         resp = requests.post(url, headers=headers, json=payload, timeout=20)
         if not resp.ok: raise Exception(f"Groq Error: {resp.status_code}")
         
@@ -151,12 +150,10 @@ class AIEngine:
             fn_name = tool_call["function"]["name"]
             fn_args = json.loads(tool_call["function"]["arguments"])
             res = self._execute_tool(fn_name, fn_args)
-            
             messages.append(msg)
             messages.append({"role": "tool", "tool_call_id": tool_call["id"], "name": fn_name, "content": res})
             resp2 = requests.post(url, headers=headers, json={"model": GROQ_MODEL, "messages": messages}, timeout=20)
             return resp2.json()["choices"][0]["message"]["content"]
-            
         return msg["content"]
 
     def _call_ollama(self, user_input: str) -> str:
@@ -166,9 +163,7 @@ class AIEngine:
         for h in self.conversation_history[-5:]:
             messages.extend([{"role": "user", "content": h["user"]}, {"role": "assistant", "content": h["assistant"]}])
         messages.append({"role": "user", "content": user_input})
-        
         resp = requests.post(url, json={"model": OLLAMA_MODEL, "messages": messages, "stream": False}, timeout=60)
-        if not resp.ok: raise Exception("Ollama Offline")
         return resp.json()["message"]["content"]
 
     def process(self, user_input: str) -> tuple[str, str | None]:
@@ -182,7 +177,7 @@ class AIEngine:
             except Exception as e:
                 logger.warning(f"Falha na Engine {self.current_engine}: {e}")
                 continue
-        return ("Todos os motores neurais falharam. Verifique sua conexão ou API keys.", None)
+        return ("Todos os motores neurais falharam.", None)
 
     def _clean_for_speech(self, text: str) -> str:
         text = re.sub(r"```[\s\S]*?```", " [código na tela] ", text)

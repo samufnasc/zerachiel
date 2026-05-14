@@ -1,5 +1,5 @@
 # ============================================================
-# main_gui.py — Orquestrador Neural v3.9 (Windows)
+# main_gui.py — Orquestrador Neural v4.1 (Final)
 # ============================================================
 
 import sys
@@ -37,7 +37,7 @@ def main():
         app = AssistantGUI(ai_engine=ai, voice_output=voice)
 
         def speak_with_listener(text):
-            if app.pause_speaking_event.is_set(): return # Respeita pausa de fala
+            if app.pause_speaking_event.is_set(): return
             
             stop_ev = threading.Event()
             _is_speaking_flag.set()
@@ -49,7 +49,10 @@ def main():
                 finally:
                     stop_ev.set()
                     _is_speaking_flag.clear()
-                    app.set_status("waiting", "SISTEMA PRONTO", "#00ff88")
+                    if not app.pause_listening_event.is_set():
+                        app.set_status("waiting", "NÚCLEO ONLINE", "#00ff88")
+                    else:
+                        app.set_status("paused", "ESCUTA PAUSADA", "#ff9900")
 
             def l_thread():
                 while not stop_ev.is_set():
@@ -86,7 +89,7 @@ def main():
             is_awake = False
             while not app.stop_event.is_set():
                 try:
-                    # Comandos da Fila (Texto)
+                    # Comandos da Fila (Texto ou Anexo)
                     try:
                         t = app.command_queue.get_nowait()
                         if t: 
@@ -111,7 +114,7 @@ def main():
                             else:
                                 process_command(rec)
                     else:
-                        # Se pausado, apenas aguarda um pouco
+                        # Se pausado, apenas aguarda
                         time.sleep(0.5)
                 except Exception as e:
                     logger.error(f"Erro no loop: {e}")

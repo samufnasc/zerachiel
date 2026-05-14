@@ -1,43 +1,26 @@
 # ============================================================
-# gui_theme.py — Paleta Cyberpunk Neon-Dark (Zerachiel v3.3)
-# Para trocar o tema, edite apenas este arquivo.
+# gui_theme.py — Cores e Estética Cyberpunk (Zerachiel v4.0)
 # ============================================================
 
+import customtkinter as ctk
+
 COLORS = {
-    # ── Fundos ────────────────────────────────────────────────
-    "bg_root":       "#050510",   # janela principal
-    "bg_panel":      "#08081a",   # header, status, waveform
-    "bg_card":       "#0a0a1f",   # chat
-    "bg_input":      "#06060f",   # campo de texto
-
-    # ── Neons ─────────────────────────────────────────────────
-    "cyan":          "#00f5ff",   # cor dominante
-    "purple":        "#bf00ff",   # destaques / engine badge
-    "green":         "#00ff88",   # waiting / OK
-    "red":           "#ff003c",   # listening / alerta
-    "amber":         "#ff9900",   # mensagens do usuário
-    "blue":          "#4488ff",   # thinking / processando
-
-    # ── Texto ─────────────────────────────────────────────────
-    "text_primary":  "#c8c8f0",   # texto principal
-    "text_dim":      "#2e2e55",   # timestamps, texto secundário
-
-    # ── Bordas ────────────────────────────────────────────────
-    "border_cyan":   "#00f5ff",
-    "border_dim":    "#14142a",
-
-    # ── Fonte monospace ───────────────────────────────────────
-    "font_mono":     "Consolas",
+    "bg_root": "#0a0a0f",      # Fundo ultra escuro (baseado no seu site)
+    "bg_panel": "#12121a",     # Painéis e cabeçalho
+    "bg_card": "#161622",      # Área do chat
+    "bg_input": "#1a1a2e",     # Campo de digitação
+    "border_dim": "#1e1e2e",   # Bordas discretas
+    "cyan": "#00f5a0",         # Verde Neon (Acento Principal)
+    "blue": "#00d4ff",         # Azul Neon (Acento Secundário)
+    "purple": "#7d5fff",       # Roxo futurista
+    "red": "#ff4757",          # Alerta/Perigo
+    "green": "#00f5a0",        # Sucesso
+    "amber": "#ffdd57",        # Aviso
+    "text_primary": "#e0e0f0", # Texto claro
+    "text_muted": "#555577",   # Texto secundário
+    "font_mono": "Consolas",
 }
 
-
 def apply_ctk_theme():
-    """
-    Configura o CustomTkinter.
-    DEVE ser chamado ANTES de instanciar qualquer widget CTk.
-    Em gui.py: chamado no início de AssistantGUI.__init__(),
-    antes de super().__init__().
-    """
-    import customtkinter as ctk
     ctk.set_appearance_mode("dark")
-    ctk.set_default_color_theme("dark-blue")
+    ctk.set_default_color_theme("blue")
