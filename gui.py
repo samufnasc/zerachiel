@@ -156,6 +156,9 @@ class AssistantGUI(ctk.CTk):
         self.btn_attach = ctk.CTkButton(btn_f, text="📎 ANEXAR", width=110, height=35, fg_color=COLORS["blue"], text_color=COLORS["bg_root"], font=("Consolas", 12, "bold"), command=self.attach_file)
         self.btn_attach.pack(side="left", padx=5)
 
+        self.btn_screen = ctk.CTkButton(btn_f, text="👁 TELA", width=90, height=35, fg_color=COLORS["green"], text_color=COLORS["bg_root"], font=("Consolas", 12, "bold"), command=self.capture_screen_action)
+        self.btn_screen.pack(side="left", padx=5)
+
         self.btn_listen = ctk.CTkButton(btn_f, text="⏸ ESCUTA", width=110, height=35, fg_color="transparent", border_width=2, border_color=COLORS["amber"], text_color=COLORS["amber"], font=("Consolas", 12, "bold"), command=self.toggle_listen)
         self.btn_listen.pack(side="left", padx=5)
         
@@ -206,6 +209,10 @@ class AssistantGUI(ctk.CTk):
                 self.command_queue.put(f"Analise este arquivo '{filename}':\n\n{content}")
             except Exception as e:
                 messagebox.showerror("Erro", f"Não foi possível ler o arquivo: {e}")
+
+    def capture_screen_action(self):
+        self.add_message("user", "👁 Captura de tela solicitada")
+        self.command_queue.put("Captura de tela: descreva o que está aparecendo na tela agora, resuma e aponte qualquer problema visível.")
 
     def toggle_listen(self):
         if self.pause_listening_event.is_set():

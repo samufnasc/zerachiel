@@ -3,3 +3,10 @@ PyAudio>=0.2.13
 comtypes>=1.2.0
 requests>=2.31.0
 edge-tts>=6.1.0
+customtkinter>=5.2.0
+pygame>=2.5.0
+python-dotenv>=1.0.0
+mss>=7.0.0
+google-genai>=1.0.0
+# requests 2.32.x exige chardet < 6.0.0 (evita RequestsDependencyWarning)
+chardet>=5.0,<6

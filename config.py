@@ -20,16 +20,54 @@ PHRASE_TIME_LIMIT = 15
 
 INTERRUPT_PHRASES = ["pare", "pode parar", "silêncio", "espera", "pausa"]
 
+# Frases que ativam a visão/captura de tela
+SCREEN_REQUEST_KEYWORDS = [
+    "veja a tela",
+    "olhe a tela",
+    "veja o monitor",
+    "olhe o monitor",
+    "capture a tela",
+    "captura de tela",
+    "o que está na tela",
+    "o que esta na tela",
+    "o que tem na tela",
+    "o que aparece na tela",
+    "o que esta aparecendo na tela",
+    "ver a tela",
+]
+
 # Motores de IA
 AI_ENGINE = "gemini"
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-2.0-flash"
+
+# Modelos Gemini disponíveis (rotação por quota diária gratuita).
+# Ordem de uso: quanto menor o índice, mais prioritário.
+GEMINI_MODELS = [
+    "gemini-flash-latest",
+    "gemma-4-26b-a4b-it",
+    "gemma-4-31b-it",
+    "gemini-3.5-flash",
+    "gemini-flash-lite-latest",
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-robotics-er-1.6-preview",
+    "gemini-robotics-er-2-preview",
+]
+GEMINI_MODEL = GEMINI_MODELS[0]  # alias retrocompatível
+
+# Guarda quais modelos Gemini atingiram a quota diária (persistido por dia)
+GEMINI_QUOTA_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".gemini_quota_state.json")
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = "llama-3.1-8b-instant"
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 OLLAMA_MODEL = "llama3.2"
+OLLAMA_TIMEOUT = 20
+OLLAMA_SLOW_THRESHOLD = 12
 
 # Diretórios
 BASE_SANDBOX = os.path.join(os.path.expanduser("~"), "ZerachielFiles")

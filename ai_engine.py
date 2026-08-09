@@ -5,9 +5,12 @@
 import re
 import os
 import json
+import time
+import base64
 import requests
 import logging
 import unicodedata
+from datetime import datetime
 from tkinter import messagebox
 from config import (
     ASSISTANT_NAME,
@@ -16,14 +19,34 @@ from config import (
     GROQ_MODEL,
     OLLAMA_BASE_URL,
     OLLAMA_MODEL,
+    OLLAMA_TIMEOUT,
+    OLLAMA_SLOW_THRESHOLD,
     GEMINI_API_KEY,
-    GEMINI_MODEL,
+    GEMINI_MODELS,
+    GEMINI_QUOTA_STATE_FILE,
     SYSTEM_PROMPT,
     TOOLS_DEFINITION,
     ALLOWED_DIRS,
+    SCREEN_REQUEST_KEYWORDS,
 )
 
 logger = logging.getLogger("VoiceAssistant")
+
+
+class OllamaSlowError(Exception):
+    """Levantada quando o Ollama demora mais que o limite aceitável."""
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    """Detecta erros de quota/limite diário (429 / RESOURCE_EXHAUSTED)."""
+    try:
+        from google.genai import errors
+        if isinstance(exc, errors.ClientError) and getattr(exc, "status_code", None) == 429:
+            return True
+    except Exception:
+        pass
+    text = str(exc)
+    return "RESOURCE_EXHAUSTED" in text or "quota" in text.lower() or "429" in text
 
 def _normalize_dir_key(text: str) -> str:
     text = text.lower().strip()
@@ -47,10 +70,59 @@ class AIEngine:
         self.conversation_history = []
         self.current_engine = "GEMINI"
         self._last_response = ""
+        self._gemini_cursor = 0
+        self._quota_state_file = GEMINI_QUOTA_STATE_FILE
+        self._exhausted_today = self._load_quota_state()
+
+    # ---------- Rotação de modelos Gemini ----------
+
+    def _load_quota_state(self) -> set:
+        try:
+            with open(self._quota_state_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("date") == datetime.now().strftime("%Y-%m-%d"):
+                return set(data.get("exhausted", []))
+        except (FileNotFoundError, ValueError, TypeError):
+            pass
+        return set()
+
+    def _save_quota_state(self):
+        try:
+            data = {"date": datetime.now().strftime("%Y-%m-%d"), "exhausted": sorted(self._exhausted_today)}
+            with open(self._quota_state_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.debug(f"Não foi possível salvar estado de quota: {e}")
+
+    def _next_available_gemini(self, exclude: set | None = None) -> str | None:
+        """Retorna o próximo modelo Gemini ainda com quota diária livre."""
+        exclude = exclude or set()
+        total = len(GEMINI_MODELS)
+        for _ in range(total):
+            model = GEMINI_MODELS[self._gemini_cursor % total]
+            self._gemini_cursor = (self._gemini_cursor + 1) % total
+            if model not in self._exhausted_today and model not in exclude:
+                return model
+        return None
+
+    def _has_available_gemini(self, exclude: set | None = None) -> bool:
+        exclude = exclude or set()
+        return any(m not in self._exhausted_today and m not in exclude for m in GEMINI_MODELS)
+
+    def _mark_quota_exhausted(self, model: str):
+        self._exhausted_today.add(model)
+        self._save_quota_state()
+        logger.warning(f"Quota diária esgotada: {model}")
 
     def _file_manager(self, action: str, filename: str = "", content: str = "", directory: str = "") -> str:
         resolved_dir = _resolve_directory(directory)
         safe_filename = re.sub(r'[\\/:*?"<>|]', "_", filename).strip()
+
+        # Ação "list" não requer nome de arquivo
+        if action == "list":
+            if not os.path.isdir(resolved_dir): return "ERRO: Diretório não encontrado."
+            return f"Arquivos: " + ", ".join(os.listdir(resolved_dir))
+
         if not safe_filename: return "ERRO: Nome de arquivo inválido."
         
         filepath = os.path.join(resolved_dir, safe_filename)
@@ -76,8 +148,6 @@ class AIEngine:
             elif action == "read":
                 if not os.path.exists(filepath): return "ERRO: Arquivo não encontrado."
                 with open(filepath, "r", encoding="utf-8") as f: return f.read()[:2000]
-            elif action == "list":
-                return f"Arquivos: " + ", ".join(os.listdir(resolved_dir))
         except Exception as e:
             return f"ERRO ao manipular arquivo: {e}"
         return "Ação inválida."
@@ -93,41 +163,31 @@ class AIEngine:
         if tool_name == "file_manager": return self._file_manager(**arguments)
         return "Ferramenta não encontrada."
 
-    def _call_gemini(self, user_input: str) -> str:
-        self.current_engine = "GEMINI"
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    def _call_gemini(self, user_input: str, model: str | None = None) -> str:
+        model = model or GEMINI_MODELS[0]
+        self.current_engine = model
+        if not GEMINI_API_KEY:
+            raise Exception("GEMINI_API_KEY não configurada")
+        from google import genai
+        from google.genai import types as genai_types
+        client = genai.Client(api_key=GEMINI_API_KEY)
+
         contents = []
         for h in self.conversation_history[-5:]:
             contents.append({"role": "user", "parts": [{"text": h["user"]}]})
             contents.append({"role": "model", "parts": [{"text": h["assistant"]}]})
         contents.append({"role": "user", "parts": [{"text": user_input}]})
-        
-        payload = {
-            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT + " SEJA CRITERIOSO: Só crie arquivos se o usuário pedir explicitamente. Para analisar anexos, use o conteúdo fornecido."}]},
-            "contents": contents,
-            "tools": [{"functionDeclarations": [t["function"] for t in TOOLS_DEFINITION]}]
-        }
-        resp = requests.post(url, json=payload, timeout=30)
-        if resp.status_code == 429: raise Exception("Quota Exceeded")
-        if not resp.ok: raise Exception(f"Gemini Error: {resp.status_code}")
-        
-        data = resp.json()
-        parts = data["candidates"][0]["content"]["parts"]
-        
-        for part in parts:
-            if "functionCall" in part:
-                fn = part["functionCall"]
-                res = self._execute_tool(fn["name"], fn.get("args", {}))
-                payload["contents"].append({"role": "model", "parts": [part]})
-                payload["contents"].append({
-                    "role": "user", 
-                    "parts": [{"functionResponse": {"name": fn["name"], "response": {"content": res}}}]
-                })
-                resp2 = requests.post(url, json=payload, timeout=30)
-                return resp2.json()["candidates"][0]["content"]["parts"][0]["text"]
-            if "text" in part:
-                return part["text"]
-        return "Gemini não gerou texto."
+
+        resp = client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT + " SEJA CRITERIOSO: Só crie arquivos se o usuário pedir explicitamente. Para analisar anexos, use o conteúdo fornecido."
+            ),
+        )
+        if not resp.text:
+            raise Exception(f"Gemini não gerou texto ({model})")
+        return resp.text
 
     def _call_groq(self, user_input: str) -> str:
         self.current_engine = "GROQ"
@@ -163,21 +223,116 @@ class AIEngine:
         for h in self.conversation_history[-5:]:
             messages.extend([{"role": "user", "content": h["user"]}, {"role": "assistant", "content": h["assistant"]}])
         messages.append({"role": "user", "content": user_input})
-        resp = requests.post(url, json={"model": OLLAMA_MODEL, "messages": messages, "stream": False}, timeout=60)
-        return resp.json()["message"]["content"]
+
+        start = time.monotonic()
+        try:
+            resp = requests.post(url, json={"model": OLLAMA_MODEL, "messages": messages, "stream": False}, timeout=OLLAMA_TIMEOUT)
+        except requests.exceptions.Timeout:
+            raise OllamaSlowError(f"Ollama sem resposta em {OLLAMA_TIMEOUT}s")
+        if resp.status_code != 200:
+            raise Exception(f"Ollama Error: {resp.status_code}")
+
+        content = resp.json()["message"]["content"]
+        elapsed = time.monotonic() - start
+        if elapsed > OLLAMA_SLOW_THRESHOLD:
+            raise OllamaSlowError(f"Ollama lento demais ({elapsed:.1f}s)")
+        return content
+
+    def process_screen(self, user_input: str) -> tuple[str, str | None]:
+        """Captura a tela e a envia ao Gemini (multimodal) para análise."""
+        if not GEMINI_API_KEY:
+            return ("Configure a chave GEMINI_API_KEY para usar a visão.", None)
+        model = self._next_available_gemini()
+        self.current_engine = model or "GEMINI"
+        if not model:
+            return ("Todos os modelos Gemini atingiram a quota diária.", None)
+        try:
+            from screen_capture import capture_screen_png_base64
+            image_b64 = capture_screen_png_base64()
+        except Exception as e:
+            logger.error(f"Erro ao capturar a tela: {e}")
+            return ("Não consegui capturar a tela. Instale a biblioteca mss e tente novamente.", None)
+
+        try:
+            from google import genai
+            from google.genai import types as genai_types
+            client = genai.Client(api_key=GEMINI_API_KEY)
+            resp = client.models.generate_content(
+                model=model,
+                contents=[
+                    genai_types.Part.from_bytes(data=base64.b64decode(image_b64), mime_type="image/png"),
+                    user_input,
+                ],
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=SYSTEM_PROMPT + " Analise a captura de tela com precisão, resuma o que vê e aponte problemas visíveis."
+                ),
+            )
+            text = resp.text
+        except Exception as e:
+            if _is_quota_error(e):
+                self._mark_quota_exhausted(model)
+            logger.warning(f"Falha na visão Gemini: {e}")
+            return ("Não consegui processar a imagem.", None)
+        self._last_response = text
+        return (self._clean_for_speech(text), text)
 
     def process(self, user_input: str) -> tuple[str, str | None]:
-        for method in [self._call_gemini, self._call_groq, self._call_ollama]:
+        if any(kw in user_input.lower() for kw in SCREEN_REQUEST_KEYWORDS):
             try:
-                full_text = method(user_input)
-                self._last_response = full_text
-                if "```" in full_text or len(full_text) > 500:
-                    return (self._clean_for_speech(full_text), full_text)
-                return (full_text, None)
+                return self.process_screen(user_input)
             except Exception as e:
-                logger.warning(f"Falha na Engine {self.current_engine}: {e}")
-                continue
+                logger.warning(f"Falha na visão: {e}")
+                return ("Não consegui analisar a tela. Verifique a captura e tente novamente.", None)
+
+        # Rotação: Gemini (cada modelo free) → Groq → Ollama.
+        # Se o Ollama ficar lento, volta para o próximo Gemini disponível.
+        max_attempts = len(GEMINI_MODELS) * 2 + 3
+        tried_groq = False
+        failed_here = set()
+        for _ in range(max_attempts):
+            model = self._next_available_gemini(exclude=failed_here)
+            if model:
+                try:
+                    full_text = self._call_gemini(user_input, model=model)
+                    self._last_response = full_text
+                    return self._format_output(full_text)
+                except Exception as e:
+                    if _is_quota_error(e):
+                        self._mark_quota_exhausted(model)
+                    else:
+                        failed_here.add(model)
+                        logger.warning(f"Falha no Gemini {model}: {e}")
+                    continue
+
+            if not tried_groq:
+                tried_groq = True
+                try:
+                    full_text = self._call_groq(user_input)
+                    self._last_response = full_text
+                    return self._format_output(full_text)
+                except Exception as e:
+                    logger.warning(f"Falha na Engine GROQ: {e}")
+
+            try:
+                full_text = self._call_ollama(user_input)
+                self._last_response = full_text
+                return self._format_output(full_text)
+            except OllamaSlowError:
+                logger.warning("Ollama lento — voltando para o próximo Gemini")
+                if self._has_available_gemini(exclude=failed_here):
+                    continue
+                break
+            except Exception as e:
+                logger.warning(f"Falha na Engine OLLAMA: {e}")
+                if self._has_available_gemini(exclude=failed_here):
+                    continue
+                break
         return ("Todos os motores neurais falharam.", None)
+
+    def _format_output(self, full_text: str) -> tuple[str, str | None]:
+        if "```" in full_text or len(full_text) > 500:
+            return (self._clean_for_speech(full_text), full_text)
+        return (full_text, None)
 
     def _clean_for_speech(self, text: str) -> str:
         text = re.sub(r"```[\s\S]*?```", " [código na tela] ", text)
