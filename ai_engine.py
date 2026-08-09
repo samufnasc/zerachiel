@@ -23,6 +23,7 @@ from config import (
     OLLAMA_SLOW_THRESHOLD,
     GEMINI_API_KEY,
     GEMINI_MODELS,
+    GEMINI_VISION_MODELS,
     GEMINI_QUOTA_STATE_FILE,
     SYSTEM_PROMPT,
     TOOLS_DEFINITION,
@@ -242,10 +243,6 @@ class AIEngine:
         """Captura a tela e a envia ao Gemini (multimodal) para análise."""
         if not GEMINI_API_KEY:
             return ("Configure a chave GEMINI_API_KEY para usar a visão.", None)
-        model = self._next_available_gemini()
-        self.current_engine = model or "GEMINI"
-        if not model:
-            return ("Todos os modelos Gemini atingiram a quota diária.", None)
         try:
             from screen_capture import capture_screen_png_base64
             image_b64 = capture_screen_png_base64()
@@ -253,26 +250,39 @@ class AIEngine:
             logger.error(f"Erro ao capturar a tela: {e}")
             return ("Não consegui capturar a tela. Instale a biblioteca mss e tente novamente.", None)
 
-        try:
-            from google import genai
-            from google.genai import types as genai_types
-            client = genai.Client(api_key=GEMINI_API_KEY)
-            resp = client.models.generate_content(
-                model=model,
-                contents=[
-                    genai_types.Part.from_bytes(data=base64.b64decode(image_b64), mime_type="image/png"),
-                    user_input,
-                ],
-                config=genai_types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT + " Analise a captura de tela com precisão, resuma o que vê e aponte problemas visíveis."
-                ),
-            )
-            text = resp.text
-        except Exception as e:
-            if _is_quota_error(e):
-                self._mark_quota_exhausted(model)
-            logger.warning(f"Falha na visão Gemini: {e}")
-            return ("Não consegui processar a imagem.", None)
+        from google import genai
+        from google.genai import types as genai_types
+        client = genai.Client(api_key=GEMINI_API_KEY)
+        failed_models = set()
+        for model in GEMINI_VISION_MODELS:
+            if model in self._exhausted_today or model in failed_models:
+                continue
+            self.current_engine = model
+            try:
+                resp = client.models.generate_content(
+                    model=model,
+                    contents=[
+                        genai_types.Part.from_bytes(data=base64.b64decode(image_b64), mime_type="image/png"),
+                        user_input,
+                    ],
+                    config=genai_types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT + " Analise a captura de tela com precisão, resuma o que vê e aponte problemas visíveis."
+                    ),
+                )
+                if not resp.text:
+                    raise Exception(f"Gemini não gerou texto ({model})")
+                text = resp.text
+                self._gemini_cursor = 0
+                break
+            except Exception as e:
+                if _is_quota_error(e):
+                    self._mark_quota_exhausted(model)
+                else:
+                    failed_models.add(model)
+                logger.warning(f"Falha na visão {model}: {e}")
+        else:
+            return ("Não consegui processar a imagem com nenhum modelo disponível.", None)
+
         self._last_response = text
         return (self._clean_for_speech(text), text)
 
@@ -295,6 +305,7 @@ class AIEngine:
                 try:
                     full_text = self._call_gemini(user_input, model=model)
                     self._last_response = full_text
+                    self._gemini_cursor = 0
                     return self._format_output(full_text)
                 except Exception as e:
                     if _is_quota_error(e):

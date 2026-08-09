@@ -74,14 +74,17 @@ def main():
             
             def run():
                 try:
-                    spoken, display = ai.process(txt)
-                    app.update_engine(ai.current_engine)
-                    app.add_message("assistant", display or spoken)
-                    speak_with_listener(spoken)
-                    ai.add_to_history(txt, spoken)
-                except Exception as e:
-                    logger.error(f"Erro no processamento: {e}")
-                    app.add_message("assistant", "ERRO DE CONEXÃO NEURAL.")
+                    try:
+                        spoken, display = ai.process(txt)
+                        app.update_engine(ai.current_engine)
+                        app.add_message("assistant", display or spoken)
+                        speak_with_listener(spoken)
+                        ai.add_to_history(txt, spoken)
+                    except Exception as e:
+                        logger.error(f"Erro no processamento: {e}")
+                        app.add_message("assistant", "ERRO DE CONEXÃO NEURAL.")
+                finally:
+                    app.after(0, app.deiconify)
             
             threading.Thread(target=run, daemon=True).start()
 

@@ -58,6 +58,10 @@ GEMINI_MODELS = [
 ]
 GEMINI_MODEL = GEMINI_MODELS[0]  # alias retrocompatível
 
+# Prioridade da VISÃO: sempre os modelos gemma primeiro (multimodal),
+# depois os demais como fallback caso o gemma atinja a cota diária.
+GEMINI_VISION_MODELS = [m for m in GEMINI_MODELS if m.startswith("gemma-")] + [m for m in GEMINI_MODELS if not m.startswith("gemma-")]
+
 # Guarda quais modelos Gemini atingiram a quota diária (persistido por dia)
 GEMINI_QUOTA_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".gemini_quota_state.json")
 

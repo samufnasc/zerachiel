@@ -211,6 +211,10 @@ class AssistantGUI(ctk.CTk):
                 messagebox.showerror("Erro", f"Não foi possível ler o arquivo: {e}")
 
     def capture_screen_action(self):
+        self.iconify()
+        self.after(700, self._send_screen_capture)
+
+    def _send_screen_capture(self):
         self.add_message("user", "👁 Captura de tela solicitada")
         self.command_queue.put("Captura de tela: descreva o que está aparecendo na tela agora, resuma e aponte qualquer problema visível.")
 
